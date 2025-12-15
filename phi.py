@@ -18,7 +18,9 @@ DATASET_ID = "iamtarun/python_code_instructions_18k_alpaca"
 OUTPUT_DIR = "./output_phi2"
 
 SEQ_LEN = 512
-MAX_STEPS = 100
+MAX_STEPS = 1000
+SAVE_STEPS = 200
+SAVE_TOTAL_LIMIT = 3
 BATCH_SIZE = 4
 GRAD_ACCUM = 2
 LR = 2e-4
@@ -72,7 +74,6 @@ def main():
     model.config.use_cache = False
 
     print("Applying LoRA...")
-    print("Applying LoRA...")
     lora_config = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
@@ -96,8 +97,8 @@ def main():
         logging_steps=10,
         logging_dir=f"{OUTPUT_DIR}/logs",
         save_strategy="steps",
-        save_steps=50,
-        save_total_limit=2,
+        save_steps=SAVE_STEPS,
+        save_total_limit=SAVE_TOTAL_LIMIT,
         report_to="none",
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
