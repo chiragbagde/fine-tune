@@ -1,248 +1,120 @@
 #!/usr/bin/env python3
-"""
-Mistral-7B-Instruct-v0.3 QLoRA + LoRA fine-tuning on A40 (single GPU).
-
-Outputs:
-- training.log           -> full stdout logs
-- adapter_model/         -> LoRA adapter weights
-- tokenizer/             -> tokenizer files
-- train_metrics.json     -> Trainer metrics
-- inference.txt          -> inference sample output
-
-Runtime on A40:
-- ~30–35 minutes (500 steps)
-"""
-
 import os
-import sys
 import json
 import torch
-from datetime import datetime
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
-    BitsAndBytesConfig,
     set_seed,
+    TrainingArguments,
 )
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    PeftModel,
-)
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer
 
-# ---------------------------
-# Config
-# ---------------------------
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
+MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DATASET_ID = "iamtarun/python_code_instructions_18k_alpaca"
+OUTPUT_DIR = "./output_local"
 
-OUTPUT_DIR = "./output"
-ADAPTER_DIR = os.path.join(OUTPUT_DIR, "adapter_model")
-TOKENIZER_DIR = os.path.join(OUTPUT_DIR, "tokenizer")
-
-LOG_FILE = os.path.join(OUTPUT_DIR, "training.log")
-INFER_FILE = os.path.join(OUTPUT_DIR, "inference.txt")
-
-SEQ_LEN = 512
-MAX_STEPS = 500
-BATCH_SIZE = 2          # A40 can handle this
-GRAD_ACCUM = 4          # effective batch = 8
+SEQ_LEN = 256
+MAX_STEPS = 10
+BATCH_SIZE = 1
+GRAD_ACCUM = 2
 LR = 2e-4
 SEED = 42
 
-# LoRA
 LORA_R = 8
 LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
 
-# ---------------------------
-# Logging setup
-# ---------------------------
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-log_f = open(LOG_FILE, "w")
-sys.stdout = log_f
-sys.stderr = log_f
+set_seed(SEED)
 
-def log(msg):
-    print(msg, flush=True)
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def print_env():
-    log(f"Timestamp: {datetime.now()}")
-    log(f"CUDA available: {torch.cuda.is_available()}")
-    log(f"GPU: {torch.cuda.get_device_name(0)}")
-    log(f"PyTorch: {torch.__version__}")
-
-def format_prompt(ex):
-    inst = ex.get("instruction", "").strip()
-    inp = (ex.get("input") or "").strip()
-    out = ex.get("output", "").strip()
-
+def format_alpaca(example):
+    inst = example.get("instruction", "").strip()
+    inp = (example.get("input") or "").strip()
+    out = example.get("output", "").strip()
     if inp:
-        text = f"""### Instruction:
-{inst}
-
-### Input:
-{inp}
-
-### Response:
-{out}"""
+        text = f"Instruction: {inst}\nInput: {inp}\nOutput: {out}"
     else:
-        text = f"""### Instruction:
-{inst}
-
-### Response:
-{out}"""
+        text = f"Instruction: {inst}\nOutput: {out}"
     return {"text": text}
 
-def tokenize_fn(tokenizer, batch):
-    return tokenizer(
-        batch["text"],
-        truncation=True,
-        max_length=SEQ_LEN,
-        padding="max_length",
-    )
-
-# ---------------------------
-# Main
-# ---------------------------
 def main():
-    set_seed(SEED)
-    print_env()
-
-    log("\n--- CONFIG ---")
-    log(f"MODEL_ID: {MODEL_ID}")
-    log(f"DATASET_ID: {DATASET_ID}")
-    log(f"SEQ_LEN: {SEQ_LEN}")
-    log(f"MAX_STEPS: {MAX_STEPS}")
-    log(f"BATCH: {BATCH_SIZE}, GRAD_ACCUM: {GRAD_ACCUM}")
-    log(f"LR: {LR}")
-
-    # Tokenizer
-    log("\nLoading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    print(f"Loading tokenizer for {MODEL_ID}...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    # Dataset
-    log("\nLoading dataset...")
+    print("Loading dataset and applying formatting...")
     dataset = load_dataset(DATASET_ID)
-    dataset = dataset.map(format_prompt)
+    train_dataset = dataset["train"].map(format_alpaca)
 
-    log("Tokenizing...")
-    tokenized = dataset.map(
-        lambda b: tokenize_fn(tokenizer, b),
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-    )
-
-    # Model (QLoRA)
-    log("\nLoading model in 4-bit (QLoRA)...")
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-
+    print(f"Loading model in bf16...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        quantization_config=bnb,
-        device_map={"": 0},
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
     )
-
-    model = prepare_model_for_kbit_training(model)
     model.config.use_cache = False
+    model.enable_input_require_grads()
 
-    # LoRA
-    log("Applying LoRA...")
-    lora = LoraConfig(
+    print("Applying LoRA...")
+    lora_config = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=LORA_DROPOUT,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora)
+    model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Training
-    log("\nStarting training...")
-    args = TrainingArguments(
+    sft_config = TrainingArguments(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
         max_steps=MAX_STEPS,
         learning_rate=LR,
-        fp16=True,
-        logging_steps=25,
-        save_strategy="no",
+        lr_scheduler_type="constant",
+        warmup_ratio=0.0,
+        bf16=(device == "cuda"),
+        logging_steps=1,
+        logging_dir=f"{OUTPUT_DIR}/logs",
+        save_strategy="steps",
+        save_steps=5,
+        save_total_limit=2,
         report_to="none",
-        optim="paged_adamw_8bit",
-        remove_unused_columns=False,
+        optim="adamw_torch",
     )
 
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
-        args=args,
-        train_dataset=tokenized["train"],
-        data_collator=DataCollatorForLanguageModeling(
-            tokenizer=tokenizer, mlm=False
-        ),
+        args=sft_config,
+        train_dataset=train_dataset,
+        tokenizer=tokenizer,
+        peft_config=None,
+        max_seq_length=SEQ_LEN,
+        dataset_text_field="text",
     )
 
-    train_result = trainer.train()
-    log("Training finished")
-
-    # Save artifacts
-    log("\nSaving LoRA adapter and tokenizer...")
-    model.save_pretrained(ADAPTER_DIR)
-    tokenizer.save_pretrained(TOKENIZER_DIR)
-
-    with open(os.path.join(OUTPUT_DIR, "train_metrics.json"), "w") as f:
-        json.dump(train_result.metrics, f, indent=2)
-
-    # Inference test
-    log("\nRunning inference test...")
-    base = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        quantization_config=bnb,
-        device_map={"": 0},
-        torch_dtype=torch.float16,
-    )
-    infer_model = PeftModel.from_pretrained(base, ADAPTER_DIR)
-    infer_model.eval()
-
-    prompt = """### Instruction:
-Write a Python function to check if a number is prime.
-
-### Response:
-"""
-
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    with torch.no_grad():
-        out = infer_model.generate(
-            **inputs,
-            max_new_tokens=200,
-            temperature=0.2,
-            do_sample=True,
-        )
-
-    result = tokenizer.decode(out[0], skip_special_tokens=True)
-    with open(INFER_FILE, "w") as f:
-        f.write(result)
-
-    log("\nInference output written to inference.txt")
-    log("\nDONE ✅")
+    print("\nStarting local test training (10 steps)...")
+    trainer.train()
+    
+    final_model_path = f"{OUTPUT_DIR}/final_model"
+    print(f"\nSaving final LoRA adapter to {final_model_path}...")
+    model.save_pretrained(final_model_path)
+    tokenizer.save_pretrained(final_model_path)
+    
+    log_history = trainer.state.log_history
+    with open(f"{OUTPUT_DIR}/training_log.json", "w") as f:
+        json.dump(log_history, f, indent=2)
+    
+    print(f"Training complete! Outputs saved to {OUTPUT_DIR}/")
 
 if __name__ == "__main__":
     main()
